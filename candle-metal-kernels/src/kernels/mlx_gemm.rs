@@ -66,16 +66,17 @@ fn select_tile_config(
     b_trans: bool,
     device_type: MetalDeviceType,
 ) -> TileConfig {
-    // Special case: For very small M (vector-matrix multiply),
-    // use the original 32x32 tile to avoid thread waste.
-    // When M is very small (< bm), using larger bm values causes significant
-    // thread underutilization because most threads in the M dimension have no work.
-    // This is critical for benchmarks like [1, 2048] @ [2048, 2048] (m=1).
+    // Special case: For small M, use the 32-row tile to avoid thread waste.
+    // When M is small (< bm), larger bm values leave most threads in the M
+    // dimension with no work. This is critical for vector-matrix multiplies
+    // like [1, 2048] @ [2048, 2048] (m=1).
     //
-    // We use m < 16 as the threshold because:
-    // - For m=1 to m=15, even 32x32 tile has some waste but it's the smallest available
-    // - For m >= 16, the larger tiles can provide better throughput despite some waste
-    if m < 16 {
+    // The threshold is the largest M that still fits in a single 32-row tile.
+    // Using bm=32 there costs nothing in M tiles (ceil(m/32) == ceil(m/64) == 1)
+    // while halving the rows each threadgroup has to compute. For m=16..32 the
+    // previous `m < 16` cutoff sent single-M-tile shapes to a 64-row tile that
+    // computed 42 rows of zeros.
+    if m <= 32 {
         return TILE_32_32_16_2_2;
     }
 
