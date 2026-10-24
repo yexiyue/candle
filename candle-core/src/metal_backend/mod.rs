@@ -2040,6 +2040,56 @@ impl MetalStorage {
             (false, false, false, false) => kernel_name(op, &self.dtype, "_strided"),
         };
 
+        // Broadcast fast path: a contiguous lhs with a row-broadcast rhs
+        // ((B,1,D)->(B,T,D) modulation/gating) or a pure bias broadcast
+        // ((D,)->(B,T,D)). The rhs element index collapses to
+        // `(i / group_len) * src_stride + i % block_len`, replacing the
+        // generic per-element multi-dim div/mod of the strided kernel. The
+        // kernel reads exactly the offsets the checked strides imply.
+        if !lhs_is_scalar
+            && !rhs_is_scalar
+            && lhs_contiguous
+            && !rhs_contiguous
+            && self.dtype == DType::F32
+            && dtype == self.dtype
+            && shape.dims().len() == 3
+            && rhs_l.shape().dims() == shape.dims()
+        {
+            let dims = shape.dims();
+            let (_, d1, d2) = (dims[0], dims[1], dims[2]);
+            let strides = rhs_l.stride();
+            let params = if strides == [d2, 0, 1] && d1 > 1 {
+                Some((d2, d1 * d2, d2)) // (block_len, group_len, src_stride)
+            } else if strides == [0, 0, d2] {
+                Some((d2, el_count, d2))
+            } else {
+                None
+            };
+            if let Some((block_len, group_len, src_stride)) = params {
+                let buffer = device
+                    .new_buffer_builder()
+                    .with_size_for(el_count, dtype)
+                    .with_label(op)
+                    .build()?;
+                candle_metal_kernels::call_binary_rbcast(
+                    &device.device,
+                    &encoder,
+                    &device.kernels,
+                    format!("{op}_f32_rbcast"),
+                    self.dtype.size_in_bytes(),
+                    el_count,
+                    block_len,
+                    group_len,
+                    src_stride,
+                    lhs,
+                    rhs,
+                    &buffer,
+                )
+                .map_err(MetalError::from)?;
+                return Ok(Self::new(buffer, device.clone(), el_count, dtype));
+            }
+        }
+
         let buffer = if kernel == contiguous_kernel {
             let buffer = device
                 .new_buffer_builder()
@@ -2592,6 +2642,94 @@ mod transpose2_copy_tests {
                         panic!("bit mismatch b={b} t={t} h={h} d={d} swap={swap}");
                     }
                 }
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod binary_rbcast_tests {
+    use crate::{Device, Tensor};
+
+    /// The broadcast fast path must produce exactly the same bytes as the
+    /// CPU broadcast path: it is elementwise with no reductions, and its rhs
+    /// indexing is a direct collapse of the checked broadcast strides.
+    /// GPU tests share one Metal device/stream, so run single threaded.
+    #[test]
+    #[ignore = "requires a Metal device; run with --test-threads=1"]
+    fn binary_rbcast_matches_cpu_bitwise() {
+        let device = Device::new_metal(0).unwrap();
+        let cpu = Device::Cpu;
+        let mut state = 0x00C0_FFEE_u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            ((state >> 16) as f32 / 32768.0 - 1.0) * 2.0
+        };
+        for (b, t, d) in [
+            (2usize, 534usize, 1024usize), // gating/modulation shape
+            (2usize, 128usize, 1024usize),
+            (1usize, 97usize, 64usize),
+            (3usize, 7usize, 8usize),
+        ] {
+            // Case A: (B,1,D) rhs broadcast over the middle dim.
+            let n = b * t * d;
+            let lhs: Vec<f32> = (0..n).map(|_| next()).collect();
+            let rhs: Vec<f32> = (0..b * d).map(|_| next()).collect();
+            for op in ["mul", "add"] {
+                let got = {
+                    let l = Tensor::from_vec(lhs.clone(), (b, t, d), &device).unwrap();
+                    let r = Tensor::from_vec(rhs.clone(), (b, 1, d), &device)
+                        .unwrap()
+                        .broadcast_as((b, t, d))
+                        .unwrap();
+                    let out = match op {
+                        "mul" => l.mul(&r).unwrap(),
+                        _ => l.add(&r).unwrap(),
+                    };
+                    out.to_device(&cpu).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap()
+                };
+                let want = {
+                    let l = Tensor::from_vec(lhs.clone(), (b, t, d), &cpu).unwrap();
+                    let r = Tensor::from_vec(rhs.clone(), (b, 1, d), &cpu)
+                        .unwrap()
+                        .broadcast_as((b, t, d))
+                        .unwrap();
+                    let out = match op {
+                        "mul" => l.mul(&r).unwrap(),
+                        _ => l.add(&r).unwrap(),
+                    };
+                    out.flatten_all().unwrap().to_vec1::<f32>().unwrap()
+                };
+                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                    assert!(
+                        g.to_bits() == w.to_bits(),
+                        "caseA b={b} t={t} d={d} op={op} at {i}: {g} vs {w}"
+                    );
+                }
+            }
+            // Case C: (D,) bias broadcast over both leading dims.
+            let bias: Vec<f32> = (0..d).map(|_| next()).collect();
+            let got = {
+                let l = Tensor::from_vec(lhs.clone(), (b, t, d), &device).unwrap();
+                let r = Tensor::from_vec(bias.clone(), d, &device)
+                    .unwrap()
+                    .broadcast_as((b, t, d))
+                    .unwrap();
+                l.mul(&r).unwrap().to_device(&cpu).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            };
+            let want = {
+                let l = Tensor::from_vec(lhs, (b, t, d), &cpu).unwrap();
+                let r = Tensor::from_vec(bias, d, &cpu)
+                    .unwrap()
+                    .broadcast_as((b, t, d))
+                    .unwrap();
+                l.mul(&r).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap()
+            };
+            for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert!(
+                    g.to_bits() == w.to_bits(),
+                    "caseC b={b} t={t} d={d} at {i}: {g} vs {w}"
+                );
             }
         }
     }

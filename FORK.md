@@ -71,6 +71,23 @@ upstream.
   Behaviour-only, no public API change in `candle-core` (the launcher lives
   in `candle-metal-kernels`, an internal dependency).
 
+### `candle-core` + `candle-metal-kernels`: broadcast fast path for binary ops (Metal)
+
+- Motivation: a binary op with a contiguous lhs and a broadcast rhs —
+  `(B,1,D)->(B,T,D)` gating/modulation or `(D,)->(B,T,D)` bias — dispatches
+  to the generic strided kernel, which computes a multi-dim div/mod index
+  chain per element for the rhs. Measured ~0.9 GB/s effective bandwidth on
+  M4 Pro for the CosyVoice3 DiT gate chain.
+- Change: when the lhs is contiguous, both are f32 3-D with matching
+  broadcast shapes, and the rhs strides are exactly `[D, 0, 1]` or
+  `[0, 0, D]`, dispatch to `binary_<op>_f32_rbcast`: the rhs index collapses
+  to `(i / group_len) * src_stride + i % block_len`, matching the checked
+  strides by construction. Every other shape keeps the existing path.
+  Elementwise, so bit-identical by construction (unit-tested against the
+  CPU broadcast path for both shapes).
+- Effect: CosyVoice3 DiT gate broadcasts. Behaviour-only, no public API
+  change in `candle-core` (launcher lives in `candle-metal-kernels`).
+
 ## Removing the fork
 
 Delete the `[patch.crates-io]` block in the Talechime workspace `Cargo.toml`,

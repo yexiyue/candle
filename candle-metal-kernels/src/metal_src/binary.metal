@@ -115,6 +115,37 @@ template <
     }
 }
 
+// Fast path for a contiguous lhs and a broadcast rhs whose element index
+// collapses to `(i / group_len) * src_stride + i % block_len`. This covers
+// the two common broadcast shapes: (B,1,D)->(B,T,D) modulation/gating
+// (group_len = T*D, src_stride = D, block_len = D) and (D,)->(B,T,D) bias
+// (group_len = el_count, src_stride = D, block_len = D). The generic
+// strided kernel computes a multi-dim div/mod chain per element instead.
+template <
+    typename T,
+    typename U,
+    typename binary,
+    uint W = work_per_thread<T>()>
+[[kernel]] void binary_kernel_rbcast(
+    constant size_t &dim,
+    constant size_t &block_len,
+    constant size_t &group_len,
+    constant size_t &src_stride,
+    device const T *left,
+    device const T *right,
+    device U *output,
+    uint tid [[ thread_position_in_grid ]]
+) {
+    binary op;
+    const uint step = div_ceil<W>(dim);
+    #pragma clang loop unroll(full)
+    for (uint i = tid; i < dim; i += step) {
+        const uint block = i / group_len;
+        const uint within = i % block_len;
+        output[i] = static_cast<U>(op(left[i], right[block * src_stride + within]));
+    }
+}
+
 // Macros to help initialize kernels
 #define init_kernel(name, func, ...) \
   template [[host_name(name)]] [[kernel]] decltype(func<__VA_ARGS__>) func<__VA_ARGS__>;
@@ -128,7 +159,8 @@ template <
     init_kernel(#op_name "_" #tname "_cs", binary_kernel_strided, t, u, binary_op, cont_indexer, scalar_indexer)            \
     init_kernel(#op_name "_" #tname "_sc", binary_kernel_strided, t, u, binary_op, scalar_indexer, cont_indexer)            \
     init_kernel(#op_name "_" #tname "_rss", binary_kernel_strided, t, u, binary_op, scalar_indexer, strided_indexer)        \
-    init_kernel(#op_name "_" #tname "_lss", binary_kernel_strided, t, u, binary_op, strided_indexer, scalar_indexer)
+    init_kernel(#op_name "_" #tname "_lss", binary_kernel_strided, t, u, binary_op, strided_indexer, scalar_indexer) \
+    init_kernel(#op_name "_" #tname "_rbcast", binary_kernel_rbcast, t, u, binary_op)
 
 #if defined(__HAVE_BFLOAT__)
 #define init_binary(bop)                            \

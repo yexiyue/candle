@@ -81,3 +81,48 @@ pub fn call_binary_strided<S: ToString>(
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
+
+/// Broadcast fast path: contiguous lhs plus an rhs whose element index is
+/// `(i / group_len) * src_stride + i % block_len` (see
+/// `binary_kernel_rbcast` for the two covered broadcast shapes).
+#[allow(clippy::too_many_arguments)]
+pub fn call_binary_rbcast<S: ToString>(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    kernel_name: S,
+    dtype_size: usize,
+    length: usize,
+    block_len: usize,
+    group_len: usize,
+    src_stride: usize,
+    left: BufferOffset,
+    right: BufferOffset,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let kernel_name = kernel_name.to_string();
+    let pipeline = kernels.load_pipeline(device, Source::Binary, kernel_name.clone())?;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    let tile_size = get_tile_size(dtype_size);
+    let tiles = length.div_ceil(tile_size);
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, tiles);
+
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "binary_rbcast {kernel_name} elems={length}");
+    set_params!(
+        encoder,
+        (
+            length,
+            block_len,
+            group_len,
+            src_stride,
+            &left,
+            &right,
+            Output::new(output)
+        )
+    );
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}

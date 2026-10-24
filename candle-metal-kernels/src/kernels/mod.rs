@@ -15,7 +15,7 @@ pub mod ternary;
 pub mod unary;
 
 pub use affine::*;
-pub use binary::{call_binary_contiguous, call_binary_strided};
+pub use binary::{call_binary_contiguous, call_binary_rbcast, call_binary_strided};
 pub use cast::{call_cast_contiguous, call_cast_strided};
 pub use convolution::*;
 pub use fill::*;
