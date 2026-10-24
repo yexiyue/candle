@@ -2795,3 +2795,39 @@ mod binary_rbcast_tests {
         }
     }
 }
+
+#[cfg(test)]
+mod binary_rbcast_timing {
+    use crate::{Device, Tensor};
+
+    #[test]
+    #[ignore = "requires a Metal device; run with --test-threads=1"]
+    fn broadcast_mul_stage_timing() {
+        let device = Device::new_metal(0).unwrap();
+        let (b, t, d) = (2usize, 534usize, 1024usize);
+        let lhs = Tensor::randn(0f32, 1f32, (b, t, d), &device).unwrap();
+        let wide = Tensor::randn(0f32, 1f32, (b, 1, 6 * d), &device).unwrap();
+        let gate_view = wide.narrow(2, d, d).unwrap();
+        let row = Tensor::randn(0f32, 1f32, (b, 1, d), &device).unwrap();
+        let bias = Tensor::randn(0f32, 1f32, d, &device).unwrap();
+        let stage = |name: &str, f: &mut dyn FnMut() -> Result<Tensor, crate::Error>| {
+            for _ in 0..10 {
+                std::mem::drop(f().unwrap());
+            }
+            device.synchronize().unwrap();
+            let start = std::time::Instant::now();
+            for _ in 0..100 {
+                std::mem::drop(f().unwrap());
+            }
+            device.synchronize().unwrap();
+            eprintln!(
+                "{name}: {:.4} ms/op",
+                start.elapsed().as_secs_f64() / 100.0 * 1e3
+            );
+        };
+        stage("bmul_rowview", &mut || lhs.broadcast_mul(&gate_view));
+        stage("bmul_row", &mut || lhs.broadcast_mul(&row));
+        stage("bmul_bias", &mut || lhs.broadcast_mul(&bias));
+        stage("add_sameshape", &mut || lhs.broadcast_add(&lhs));
+    }
+}
