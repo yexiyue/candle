@@ -4,7 +4,6 @@ use crate::backend::{BackendDevice, BackendStorage};
 use crate::conv::{ParamsConv1D, ParamsConv2D, ParamsConvTranspose1D, ParamsConvTranspose2D};
 use crate::op::{BinaryOpT, CmpOp, ReduceOp, UnaryOpT};
 use crate::{CpuStorage, CpuStorageRef, DType, Error, Layout, Result, Shape};
-use candle_metal_kernels::kernels::binary::contiguous;
 use candle_metal_kernels::{
     metal::{Buffer, Commands, Device, ResidencySet},
     BufferOffset, CallConvTranspose2dCfg, Kernels, RESOURCE_OPTIONS,
@@ -1914,6 +1913,48 @@ impl BackendStorage for MetalStorage {
                         );
                     }
                 }
+                // Rank-4 transpose(1,2) views of contiguous tensors: dims
+                // (b, x1, x2, d), strides (x1*x2*d, d, x1*d, 1) — the
+                // attention (B,T,H,D) <-> (B,H,T,D) materializations. Rows
+                // of `d` contiguous elements exist in the source, so a
+                // row-chunk copy beats the element-wise strided gather. The
+                // kernel reads exactly the offsets the checked strides
+                // imply, so any layout matching the signature is handled
+                // correctly.
+                if ndim == 4
+                    && self.dtype == DType::F32
+                    && dst.dtype() == DType::F32
+                    && dst_offset.is_multiple_of(4)
+                    && src_l.start_offset().is_multiple_of(4)
+                {
+                    let dims = src_shape.dims();
+                    let (d0, d1, d2, d3) = (dims[0], dims[1], dims[2], dims[3]);
+                    if strides[3] == 1
+                        && strides[2] == d1 * d3
+                        && strides[1] == d3
+                        && strides[0] == d1 * d2 * d3
+                        && d3 % 4 == 0
+                    {
+                        let encoder = self.device.command_encoder()?;
+                        candle_metal_kernels::call_transpose2_contiguous(
+                            &self.device.device,
+                            &encoder,
+                            &self.device.kernels,
+                            candle_metal_kernels::unary::transpose2::F32,
+                            d0 * d1 * d2,
+                            d3,
+                            d2,
+                            strides[0],
+                            strides[2],
+                            src_l.start_offset() * self.dtype.size_in_bytes(),
+                            dst_offset * dst.dtype.size_in_bytes(),
+                            &self.buffer,
+                            &dst.buffer,
+                        )
+                        .map_err(MetalError::from)?;
+                        return Ok(());
+                    }
+                }
             }
             let kernel_name = match self.dtype {
                 DType::F32 => candle_metal_kernels::unary::strided::copy::FLOAT,
@@ -2483,6 +2524,75 @@ mod conv1d_tests {
                 max_abs <= 1e-5,
                 "b={b} l={l} k={k} stride={stride} max_abs={max_abs}"
             );
+        }
+    }
+}
+
+#[cfg(test)]
+mod transpose2_copy_tests {
+    use crate::{Device, Tensor};
+
+    /// The transpose(1,2)-view contiguous fast path must produce exactly the
+    /// same bytes as the CPU contiguous path: it is a pure copy with no
+    /// arithmetic, so any difference is a dispatch or offset bug. Covers
+    /// both directions of the attention (B,T,H,D) <-> (B,H,T,D) pattern.
+    /// GPU tests share one Metal device/stream, so run single threaded.
+    #[test]
+    #[ignore = "requires a Metal device; run with --test-threads=1"]
+    fn transpose2_contiguous_matches_cpu_bitwise() {
+        let device = Device::new_metal(0).unwrap();
+        let cpu = Device::Cpu;
+        let mut state = 0x00C0_FFEE_u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            ((state >> 16) as f32 / 32768.0 - 1.0) * 2.0
+        };
+        for (b, t, h, d) in [
+            (2usize, 512usize, 16usize, 64usize), // cv3 streaming attention shape
+            (2usize, 128usize, 16usize, 64usize),
+            (1usize, 1024usize, 8usize, 64usize), // IndexTTS DiT shape
+            (1usize, 492usize, 8usize, 64usize),
+            (3usize, 7usize, 5usize, 8usize),
+            (2usize, 25usize, 16usize, 64usize),
+            (1usize, 1usize, 1usize, 4usize),
+        ] {
+            let n = b * t * h * d;
+            let xs: Vec<f32> = (0..n).map(|_| next()).collect();
+            for swap in [false, true] {
+                let (sa, sb) = if swap { (h, t) } else { (t, h) };
+                let src = Tensor::from_vec(xs.clone(), (b, sa, sb, d), &device).unwrap();
+                let view = src.transpose(1, 2).unwrap();
+                let got: Vec<f32> = view
+                    .contiguous()
+                    .unwrap()
+                    .to_device(&cpu)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                let want: Vec<f32> = Tensor::from_vec(xs.clone(), (b, sa, sb, d), &cpu)
+                    .unwrap()
+                    .transpose(1, 2)
+                    .unwrap()
+                    .contiguous()
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1()
+                    .unwrap();
+                assert_eq!(got.len(), want.len());
+                for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                    if g.to_bits() != w.to_bits() {
+                        let r = i / d;
+                        let c = (i % d) / 4;
+                        eprintln!(
+                            "MISMATCH b={b} t={t} h={h} d={d} swap={swap} flat={i} row={r} chunk={c} got={g} want={w}"
+                        );
+                        panic!("bit mismatch b={b} t={t} h={h} d={d} swap={swap}");
+                    }
+                }
+            }
         }
     }
 }

@@ -140,6 +140,11 @@ pub fn call_const_set_strided(
     Ok(())
 }
 
+pub mod transpose2 {
+    pub struct Kernel(pub &'static str);
+    pub const F32: Kernel = Kernel("transpose2_contiguous_f32");
+}
+
 pub mod copy2d {
     pub struct Kernel(pub &'static str);
     pub const FLOAT: Kernel = Kernel("copy2d_f32");
@@ -190,6 +195,56 @@ pub fn call_copy2d(
         depth: 1,
     };
     let group_dims = get_block_dims(d1, d2, 1);
+    encoder.dispatch_threads(grid_dims, group_dims);
+    Ok(())
+}
+
+/// Contiguous-izing copy for rank-4 transpose(1,2) views of contiguous
+/// tensors: dims (b, x1, x2, d), strides (x1*x2*d, d, x1*d, 1) — the
+/// attention (B,T,H,D) <-> (B,H,T,D) materializations. Grid (d/4, rows);
+/// one thread moves one float4 chunk of a contiguous d-row.
+#[allow(clippy::too_many_arguments)]
+pub fn call_transpose2_contiguous(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: transpose2::Kernel,
+    rows: usize,
+    d: usize,
+    x2_len: usize,
+    s0: usize,
+    s2: usize,
+    src_o_in_bytes: usize,
+    dst_o_in_bytes: usize,
+    input: &Buffer,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Unary, name.0)?;
+    let d4 = d / 4;
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "transpose2 {} rows={rows} d={d}", name.0);
+    set_params!(
+        encoder,
+        (
+            rows as i64,
+            d4 as u32,
+            (s0 / d) as i64, // x1 * x2
+            x2_len as u32,
+            s0 as i64,
+            s2 as i64,
+            (input, src_o_in_bytes),
+            Output::with_offset(output, dst_o_in_bytes)
+        )
+    );
+
+    let grid_dims = MTLSize {
+        width: d4,
+        height: rows,
+        depth: 1,
+    };
+    let group_dims = get_block_dims(d4, rows, 1);
     encoder.dispatch_threads(grid_dims, group_dims);
     Ok(())
 }

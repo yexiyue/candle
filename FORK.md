@@ -51,6 +51,26 @@ upstream.
   fir_down ~6.6x, fir_up ~4x faster; fixed-input deviation vs the generic
   path <= 9.5e-7. Behaviour-only, no public API change.
 
+### `candle-core` + `candle-metal-kernels`: row-chunk copy for rank-4 transpose(1,2) views (Metal)
+
+- Motivation: contiguous-izing a `transpose(1, 2)` view — dims
+  `(b, x1, x2, d)` with strides `(x1*x2*d, d, x1*d, 1)`, the attention
+  `(B,T,H,D) <-> (B,H,T,D)` materializations — falls through
+  `copy_strided_src` to the element-wise strided gather because
+  `strided_blocks()` yields `MultipleBlocks` (the wrap stride between `x1`
+  rows breaks uniformity). Measured 11.6 GB/s effective bandwidth on M4 Pro
+  (~4% of available) for a 4 MB copy.
+- Change: when the stride signature above matches exactly and dtype is F32
+  with `d % 4 == 0` and both offsets 16B aligned, dispatch to
+  `transpose2_contiguous_f32`: grid `(d/4, rows)`, one thread moves one
+  float4 chunk of a contiguous d-row. The kernel reads exactly the offsets
+  the checked strides imply, so any matching layout is handled correctly;
+  every other shape keeps the existing path. Pure copy, bit-identical by
+  construction (unit-tested against the CPU contiguous path).
+- Effect: CosyVoice3/IndexTTS attention split + output transposes.
+  Behaviour-only, no public API change in `candle-core` (the launcher lives
+  in `candle-metal-kernels`, an internal dependency).
+
 ## Removing the fork
 
 Delete the `[patch.crates-io]` block in the Talechime workspace `Cargo.toml`,

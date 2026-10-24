@@ -278,3 +278,32 @@ init_const_set(i64, int64_t);
 
 init_copy2d(i32, int32_t);
 init_copy2d(i16, int16_t);
+
+// Contiguous-izing copy for rank-4 transpose(1,2) views of contiguous
+// tensors: dims (b, x1, x2, d) with strides (x1*x2*d, d, x1*d, 1) — the
+// attention (B,T,H,D) <-> (B,H,T,D) materializations. Rows of `d`
+// contiguous elements exist in the source, while the generic strided copy
+// gathers element by element. One thread per 4-element chunk (f32 only,
+// d % 4 == 0, offsets 16B aligned).
+kernel void transpose2_contiguous_f32(
+    constant int64_t &rows,
+    constant uint &d4,
+    constant int64_t &x1x2,
+    constant uint &x2_len,
+    constant int64_t &s0,
+    constant int64_t &s2,
+    device const float *src,
+    device float *dst,
+    uint2 idx [[ thread_position_in_grid ]]
+) {
+    if (idx.x >= d4 || idx.y >= rows) {
+        return;
+    }
+    const int64_t b = idx.y / x1x2;
+    const int64_t rem = idx.y % x1x2;
+    const int64_t x1 = rem / x2_len;
+    const int64_t x2 = rem % x2_len;
+    const int64_t src_i = b * s0 + x1 * d4 * 4 + x2 * s2 + (int64_t)idx.x * 4;
+    const int64_t dst_i = (int64_t)idx.y * d4 * 4 + (int64_t)idx.x * 4;
+    *(device float4 *)(dst + dst_i) = *(const device float4 *)(src + src_i);
+}
