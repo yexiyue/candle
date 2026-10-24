@@ -79,8 +79,8 @@ upstream.
   chain per element for the rhs. Measured ~0.9 GB/s effective bandwidth on
   M4 Pro for the CosyVoice3 DiT gate chain.
 - Change: when the lhs is contiguous, both are f32 3-D with matching
-  broadcast shapes, and the rhs strides are exactly `[D, 0, 1]` or
-  `[0, 0, D]`, dispatch to `binary_<op>_f32_rbcast`: the rhs index collapses
+  broadcast shapes, and the rhs strides are `[s, 0, 1]` / `[0, 0, s]` with
+  `s` a multiple of `D` (covers narrow views of modulation tensors), dispatch to `binary_<op>_f32_rbcast`: the rhs index collapses
   to `(i / group_len) * src_stride + i % block_len`, matching the checked
   strides by construction. Every other shape keeps the existing path.
   Elementwise, so bit-identical by construction (unit-tested against the

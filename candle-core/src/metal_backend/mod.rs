@@ -2058,10 +2058,13 @@ impl MetalStorage {
             let dims = shape.dims();
             let (_, d1, d2) = (dims[0], dims[1], dims[2]);
             let strides = rhs_l.stride();
-            let params = if strides == [d2, 0, 1] && d1 > 1 {
-                Some((d2, d1 * d2, d2)) // (block_len, group_len, src_stride)
-            } else if strides == [0, 0, d2] {
-                Some((d2, el_count, d2))
+            let params = if strides[2] == 1 && strides[1] == 0 && strides[0] % d2 == 0 && d1 > 1 {
+                // (block_len, group_len, src_stride); src_stride may exceed
+                // d2 when the rhs is a narrow view (e.g. a slice of a
+                // modulation tensor).
+                Some((d2, d1 * d2, strides[0]))
+            } else if strides[2] % d2 == 0 && strides[1] == 0 && strides[0] == 0 {
+                Some((d2, el_count, strides[2]))
             } else {
                 None
             };
@@ -2686,7 +2689,12 @@ mod binary_rbcast_tests {
                         "mul" => l.mul(&r).unwrap(),
                         _ => l.add(&r).unwrap(),
                     };
-                    out.to_device(&cpu).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap()
+                    out.to_device(&cpu)
+                        .unwrap()
+                        .flatten_all()
+                        .unwrap()
+                        .to_vec1::<f32>()
+                        .unwrap()
                 };
                 let want = {
                     let l = Tensor::from_vec(lhs.clone(), (b, t, d), &cpu).unwrap();
@@ -2707,6 +2715,47 @@ mod binary_rbcast_tests {
                     );
                 }
             }
+            // Case A': rhs is a narrow view (stride 6*D) of a modulation
+            // tensor, broadcast over the middle dim.
+            let wide: Vec<f32> = (0..b * 6 * d).map(|_| next()).collect();
+            let got = {
+                let l = Tensor::from_vec(lhs.clone(), (b, t, d), &device).unwrap();
+                let r = Tensor::from_vec(wide.clone(), (b, 1, 6 * d), &device)
+                    .unwrap()
+                    .narrow(2, d, d)
+                    .unwrap()
+                    .broadcast_as((b, t, d))
+                    .unwrap();
+                l.mul(&r)
+                    .unwrap()
+                    .to_device(&cpu)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            };
+            let want = {
+                let l = Tensor::from_vec(lhs.clone(), (b, t, d), &cpu).unwrap();
+                let r = Tensor::from_vec(wide, (b, 1, 6 * d), &cpu)
+                    .unwrap()
+                    .narrow(2, d, d)
+                    .unwrap()
+                    .broadcast_as((b, t, d))
+                    .unwrap();
+                l.mul(&r)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
+            };
+            for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
+                assert!(
+                    g.to_bits() == w.to_bits(),
+                    "caseA-narrow b={b} t={t} d={d} at {i}: {g} vs {w}"
+                );
+            }
             // Case C: (D,) bias broadcast over both leading dims.
             let bias: Vec<f32> = (0..d).map(|_| next()).collect();
             let got = {
@@ -2715,7 +2764,14 @@ mod binary_rbcast_tests {
                     .unwrap()
                     .broadcast_as((b, t, d))
                     .unwrap();
-                l.mul(&r).unwrap().to_device(&cpu).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap()
+                l.mul(&r)
+                    .unwrap()
+                    .to_device(&cpu)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
             };
             let want = {
                 let l = Tensor::from_vec(lhs, (b, t, d), &cpu).unwrap();
@@ -2723,7 +2779,12 @@ mod binary_rbcast_tests {
                     .unwrap()
                     .broadcast_as((b, t, d))
                     .unwrap();
-                l.mul(&r).unwrap().flatten_all().unwrap().to_vec1::<f32>().unwrap()
+                l.mul(&r)
+                    .unwrap()
+                    .flatten_all()
+                    .unwrap()
+                    .to_vec1::<f32>()
+                    .unwrap()
             };
             for (i, (g, w)) in got.iter().zip(want.iter()).enumerate() {
                 assert!(
