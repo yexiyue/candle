@@ -977,8 +977,9 @@ impl BackendStorage for MetalStorage {
             && k_size <= 64
             && c_in_k * k_size <= 4096
             && l_out > 0
-            && layout.is_contiguous()
-            && kernel_l.is_contiguous()
+        // src/kernel are indexed through their strides (including the
+        // non-contiguous per-group chunk views), so no contiguity is
+        // required here.
         {
             let out_el = dims[0] * l_out * c_out;
             let dst = self
@@ -2884,6 +2885,7 @@ mod conv1d_dense_tests {
     /// float rounding (different summation order than im2col+GEMM). Covers
     /// the grouped positional-conv geometry via the tensor-level group loop
     /// (k=31, groups=16, c=1024) plus small ungrouped shapes.
+
     #[test]
     #[ignore = "requires a Metal device; run with --test-threads=1"]
     fn conv1d_dense_matches_cpu_reference() {
@@ -2894,6 +2896,9 @@ mod conv1d_dense_tests {
             state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
             ((state >> 16) as f32 / 32768.0 - 1.0) * 2.0
         };
+        // Deterministic per-(c, l) value so both the c-major and the l-major
+        // storage orderings describe the same logical tensor.
+        let x_at = |c: usize, ll: usize| 1.0 + 2.0 * ((c * 131 + ll * 17) % 997) as f32 / 997.0;
         let cases = [
             (1usize, 1024usize, 534usize, 1024usize, 31usize, 16usize), // embed conv geometry
             (2, 1024, 128usize, 1024, 31, 16),
@@ -2902,9 +2907,30 @@ mod conv1d_dense_tests {
             (3, 16, 70usize, 12, 7, 4),  // small groups
         ];
         for (b, c_in, l, c_out, k, groups) in cases {
-            let xs: Vec<f32> = (0..b * c_in * l).map(|_| next()).collect();
+            let xs: Vec<f32> = (0..b)
+                .flat_map(|_| (0..c_in).flat_map(|c| (0..l).map(move |ll| x_at(c, ll))))
+                .collect();
             let ks: Vec<f32> = (0..c_out * (c_in / groups) * k).map(|_| next()).collect();
             let out_m = Tensor::from_vec(xs.clone(), (b, c_in, l), &device)
+                .unwrap()
+                .conv1d(
+                    &Tensor::from_vec(ks.clone(), (c_out, c_in / groups, k), &device).unwrap(),
+                    0,
+                    1,
+                    1,
+                    groups,
+                )
+                .unwrap();
+            // Same conv on a transposed-view input: exercises the fully
+            // strided (last-dim stride != 1) src indexing. The vector is
+            // built in l-major order so the (b, l, c_in) -> transpose view
+            // really equals the (b, c_in, l) logical tensor above.
+            let xs_t: Vec<f32> = (0..b)
+                .flat_map(|_| (0..l).flat_map(|ll| (0..c_in).map(move |c| x_at(c, ll))))
+                .collect();
+            let out_t = Tensor::from_vec(xs_t, (b, l, c_in), &device)
+                .unwrap()
+                .transpose(1, 2)
                 .unwrap()
                 .conv1d(
                     &Tensor::from_vec(ks.clone(), (c_out, c_in / groups, k), &device).unwrap(),
@@ -2927,15 +2953,18 @@ mod conv1d_dense_tests {
                 .to_vec3::<f32>()
                 .unwrap();
             let got = out_m.to_device(&cpu).unwrap().to_vec3::<f32>().unwrap();
+            let got_t = out_t.to_device(&cpu).unwrap().to_vec3::<f32>().unwrap();
             let flatten =
                 |v: Vec<Vec<Vec<f32>>>| -> Vec<f32> { v.into_iter().flatten().flatten().collect() };
             let got = flatten(got);
+            let got_t = flatten(got_t);
             let want = flatten(want);
             assert_eq!(got.len(), want.len());
             let mut max_abs = 0f32;
-            for (g, w) in got.iter().zip(want.iter()) {
+            for (g, t, w) in got.iter().zip(got_t.iter()).zip(want.iter()).map(|(a, b)| (a.0, a.1, b)) {
                 assert!(g.is_finite());
-                max_abs = max_abs.max((g - w).abs());
+                assert!(t.is_finite());
+                max_abs = max_abs.max((g - w).abs()).max((t - w).abs());
             }
             assert!(
                 max_abs <= 1e-5,

@@ -96,8 +96,10 @@ upstream.
   not the math — dominates: the CosyVoice3 positional conv (k=31, groups=16,
   c=1024, T~534) writes ~136 MB per call for ~4.3 GFLOP of actual work.
 - Change: when `padding == 0`, `stride == 1`, `dilation == 1`, dtype F32,
-  `k <= 64`, `c_in_per_group * k <= 4096` and both layouts are contiguous,
-  dispatch to `conv1d_dense_f32`: one thread per output element computing
+  `k <= 64`, `c_in_per_group * k <= 4096` (any strides — the kernel is
+  stride-parametric, which the grouped conv's non-contiguous per-group chunk
+  views require), dispatch to `conv1d_dense_f32`: one thread per output
+  element computing
   the full `(c_in x k)` dot product directly. Every other shape keeps the
   im2col path. Summation order differs from im2col+GEMM, gated at <= 1e-5
   against the CPU reference (incl. the grouped positional-conv geometry).
