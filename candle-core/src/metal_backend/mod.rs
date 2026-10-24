@@ -964,51 +964,13 @@ impl BackendStorage for MetalStorage {
             return Ok(Self::new(dst, device, dst_el, self.dtype));
         }
         let dst_el = dims[0] * l_out * dims[1] * k_size;
-        // Dense conv fast path: stride-1/dilation-1/valid convs with a
-        // bounded per-output dot product skip the im2col materialization
-        // entirely (one thread per output element). Grouped convs hit this
-        // once per group from the tensor-level loop, where the per-group
-        // im2col traffic — not the math — dominates.
-        let (c_out, c_in_k) = (k_dims[0], k_dims[1]);
-        if padding == 0
-            && stride == 1
-            && dilation == 1
-            && self.dtype == DType::F32
-            && k_size <= 64
-            && c_in_k * k_size <= 4096
-            && l_out > 0
-        // src/kernel are indexed through their strides (including the
-        // non-contiguous per-group chunk views), so no contiguity is
-        // required here.
-        {
-            let out_el = dims[0] * l_out * c_out;
-            let dst = self
-                .device
-                .new_buffer_builder()
-                .with_size_for(out_el, self.dtype)
-                .with_label("conv1d_dense")
-                .build()?;
-            let encoder = self.device.command_encoder()?;
-            let src = buffer_o(&self.buffer, layout, self.dtype);
-            let kbuf = buffer_o(&kernel.buffer, kernel_l, kernel.dtype());
-            candle_metal_kernels::call_conv1d_dense(
-                &self.device.device,
-                &encoder,
-                &self.device.kernels,
-                "conv1d_dense_f32",
-                l_out,
-                (c_out, c_in_k, k_size),
-                dims[0],
-                strides,
-                kernel_l.stride(),
-                src,
-                kbuf,
-                &dst,
-            )
-            .map_err(MetalError::from)?;
-            drop(encoder);
-            return Ok(Self::new(dst, device, out_el, self.dtype));
-        }
+        // NOTE: a fused direct conv1d fast path (`conv1d_dense_f32`, still
+        // compiled in candle-metal-kernels with passing gates) was tried for
+        // the stride-1/valid/grouped shapes and measured 3-4x SLOWER than
+        // im2col+GEMM on M4 Pro (naive: ~9 GB scattered re-reads; 8-wide
+        // tiled variant: runtime-bounded accumulator loop spills acc[] to
+        // local memory). The im2col buffer is L2-resident in practice, so
+        // the materialization cost assumption was wrong. Not dispatched.
         let dst = self
             .device
             .new_buffer_builder()

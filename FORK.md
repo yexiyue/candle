@@ -88,7 +88,13 @@ upstream.
 - Effect: CosyVoice3 DiT gate broadcasts. Behaviour-only, no public API
   change in `candle-core` (launcher lives in `candle-metal-kernels`).
 
-### `candle-core` + `candle-metal-kernels`: dense direct conv1d fast path (Metal)
+### `candle-metal-kernels`: dense direct conv1d kernel (Metal, NOT dispatched)
+
+> Tried for the CosyVoice3 grouped positional convs and rejected: see the
+> note in `metal_backend/mod.rs` conv1d. Kept (kernel + launcher + gates)
+> as dormant infrastructure.
+
+
 
 - Motivation: stride-1/dilation-1/valid conv1d goes through an im2col
   materialization `(b, l_out, c_in*k)` plus a GEMM. Grouped convs issue one
