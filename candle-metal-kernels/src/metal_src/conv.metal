@@ -771,3 +771,67 @@ CONV1D_SHARED_OP(half, float, conv1d_shared_f16)
 #if defined(__HAVE_BFLOAT__)
 CONV1D_SHARED_OP(bfloat, float, conv1d_shared_bf16)
 #endif
+
+// Dense stride-1/dilation-1/valid conv1d: one thread per output element
+// computing the full (c_in x k) dot product directly. The generic path
+// materializes an im2col buffer (b, l_out, c_in*k) per call before a GEMM;
+// for grouped convs the tensor-level loop issues one such call per group,
+// so the im2col traffic (not the math) dominates (e.g. k=31, groups=16
+// positional convs write ~136 MB per call at c_in_total=1024).
+template <typename T, typename A>
+METAL_FUNC void conv1d_dense(
+    constant size_t &dst_el,
+    constant size_t &l_out,
+    constant size_t &c_out,
+    constant size_t &k_size,
+    constant size_t &c_in,
+    constant size_t *src_strides,
+    constant size_t *k_strides,
+    device const T *src,
+    device const T *k,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  if (tid >= dst_el) {
+    return;
+  }
+  // dst is (b, c_out, l_out) row-major.
+  const size_t l_idx = tid % l_out;
+  const size_t co = (tid / l_out) % c_out;
+  const size_t b_idx = tid / (l_out * c_out);
+  const size_t src_base = b_idx * src_strides[0];
+  const size_t k_base = co * k_strides[0];
+  A acc = 0;
+  for (size_t c = 0; c < c_in; ++c) {
+    const size_t src_c = src_base + c * src_strides[1];
+    const size_t k_c = k_base + c * k_strides[1];
+    for (size_t kk = 0; kk < k_size; ++kk) {
+      acc += static_cast<A>(src[src_c + (l_idx + kk) * src_strides[2]]) *
+             static_cast<A>(k[k_c + kk * k_strides[2]]);
+    }
+  }
+  dst[tid] = static_cast<T>(acc);
+}
+
+#define CONV1D_DENSE_OP(TYPENAME, TYPEACC, FN_NAME) \
+kernel void FN_NAME( \
+    constant size_t &dst_el, \
+    constant size_t &l_out, \
+    constant size_t &c_out, \
+    constant size_t &k_size, \
+    constant size_t &c_in, \
+    constant size_t *src_strides, \
+    constant size_t *k_strides, \
+    device const TYPENAME *src, \
+    device const TYPENAME *k, \
+    device TYPENAME *dst, \
+    uint tid [[ thread_position_in_grid ]] \
+) { \
+  conv1d_dense<TYPENAME, TYPEACC>(dst_el, l_out, c_out, k_size, c_in, src_strides, k_strides, src, k, dst, tid); \
+} \
+
+CONV1D_DENSE_OP(float, float, conv1d_dense_f32)
+CONV1D_DENSE_OP(half, float, conv1d_dense_f16)
+#if defined(__HAVE_BFLOAT__)
+CONV1D_DENSE_OP(bfloat, float, conv1d_dense_bf16)
+#endif

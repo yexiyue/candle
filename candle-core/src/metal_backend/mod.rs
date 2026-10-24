@@ -964,6 +964,50 @@ impl BackendStorage for MetalStorage {
             return Ok(Self::new(dst, device, dst_el, self.dtype));
         }
         let dst_el = dims[0] * l_out * dims[1] * k_size;
+        // Dense conv fast path: stride-1/dilation-1/valid convs with a
+        // bounded per-output dot product skip the im2col materialization
+        // entirely (one thread per output element). Grouped convs hit this
+        // once per group from the tensor-level loop, where the per-group
+        // im2col traffic — not the math — dominates.
+        let (c_out, c_in_k) = (k_dims[0], k_dims[1]);
+        if padding == 0
+            && stride == 1
+            && dilation == 1
+            && self.dtype == DType::F32
+            && k_size <= 64
+            && c_in_k * k_size <= 4096
+            && l_out > 0
+            && layout.is_contiguous()
+            && kernel_l.is_contiguous()
+        {
+            let out_el = dims[0] * l_out * c_out;
+            let dst = self
+                .device
+                .new_buffer_builder()
+                .with_size_for(out_el, self.dtype)
+                .with_label("conv1d_dense")
+                .build()?;
+            let encoder = self.device.command_encoder()?;
+            let src = buffer_o(&self.buffer, layout, self.dtype);
+            let kbuf = buffer_o(&kernel.buffer, kernel_l, kernel.dtype());
+            candle_metal_kernels::call_conv1d_dense(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                "conv1d_dense_f32",
+                l_out,
+                (c_out, c_in_k, k_size),
+                dims[0],
+                strides,
+                kernel_l.stride(),
+                src,
+                kbuf,
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+            drop(encoder);
+            return Ok(Self::new(dst, device, out_el, self.dtype));
+        }
         let dst = self
             .device
             .new_buffer_builder()
@@ -2829,5 +2873,74 @@ mod binary_rbcast_timing {
         stage("bmul_row", &mut || lhs.broadcast_mul(&row));
         stage("bmul_bias", &mut || lhs.broadcast_mul(&bias));
         stage("add_sameshape", &mut || lhs.broadcast_add(&lhs));
+    }
+}
+
+#[cfg(test)]
+mod conv1d_dense_tests {
+    use crate::{Device, Tensor};
+
+    /// The dense stride-1 conv fast path must match the CPU reference within
+    /// float rounding (different summation order than im2col+GEMM). Covers
+    /// the grouped positional-conv geometry via the tensor-level group loop
+    /// (k=31, groups=16, c=1024) plus small ungrouped shapes.
+    #[test]
+    #[ignore = "requires a Metal device; run with --test-threads=1"]
+    fn conv1d_dense_matches_cpu_reference() {
+        let device = Device::new_metal(0).unwrap();
+        let cpu = Device::Cpu;
+        let mut state = 0x00C0_FFEE_u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            ((state >> 16) as f32 / 32768.0 - 1.0) * 2.0
+        };
+        let cases = [
+            (1usize, 1024usize, 534usize, 1024usize, 31usize, 16usize), // embed conv geometry
+            (2, 1024, 128usize, 1024, 31, 16),
+            (2, 64, 97usize, 64, 31, 1), // ungrouped dense
+            (1, 8, 40usize, 5, 3, 1),    // tiny
+            (3, 16, 70usize, 12, 7, 4),  // small groups
+        ];
+        for (b, c_in, l, c_out, k, groups) in cases {
+            let xs: Vec<f32> = (0..b * c_in * l).map(|_| next()).collect();
+            let ks: Vec<f32> = (0..c_out * (c_in / groups) * k).map(|_| next()).collect();
+            let out_m = Tensor::from_vec(xs.clone(), (b, c_in, l), &device)
+                .unwrap()
+                .conv1d(
+                    &Tensor::from_vec(ks.clone(), (c_out, c_in / groups, k), &device).unwrap(),
+                    0,
+                    1,
+                    1,
+                    groups,
+                )
+                .unwrap();
+            let want = Tensor::from_vec(xs, (b, c_in, l), &cpu)
+                .unwrap()
+                .conv1d(
+                    &Tensor::from_vec(ks, (c_out, c_in / groups, k), &cpu).unwrap(),
+                    0,
+                    1,
+                    1,
+                    groups,
+                )
+                .unwrap()
+                .to_vec3::<f32>()
+                .unwrap();
+            let got = out_m.to_device(&cpu).unwrap().to_vec3::<f32>().unwrap();
+            let flatten =
+                |v: Vec<Vec<Vec<f32>>>| -> Vec<f32> { v.into_iter().flatten().flatten().collect() };
+            let got = flatten(got);
+            let want = flatten(want);
+            assert_eq!(got.len(), want.len());
+            let mut max_abs = 0f32;
+            for (g, w) in got.iter().zip(want.iter()) {
+                assert!(g.is_finite());
+                max_abs = max_abs.max((g - w).abs());
+            }
+            assert!(
+                max_abs <= 1e-5,
+                "b={b} c_in={c_in} l={l} c_out={c_out} k={k} g={groups} max_abs={max_abs}"
+            );
+        }
     }
 }

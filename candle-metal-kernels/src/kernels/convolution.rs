@@ -419,3 +419,48 @@ pub fn call_conv1d_shared(
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
+
+/// Dense stride-1/dilation-1/valid conv1d: one thread per output element,
+/// no im2col materialization. See `conv1d_dense_f32` for the traffic
+/// rationale.
+#[allow(clippy::too_many_arguments)]
+pub fn call_conv1d_dense(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    l_out: usize,
+    (c_out, c_in, k_size): (usize, usize, usize),
+    b_size: usize,
+    src_strides: &[usize],
+    k_strides: &[usize],
+    input: BufferOffset,
+    kernel: BufferOffset,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
+    let dst_el = b_size * l_out * c_out;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "conv1d_dense {name} dst_el={dst_el}");
+    set_params!(
+        encoder,
+        (
+            dst_el,
+            l_out,
+            c_out,
+            k_size,
+            c_in,
+            src_strides,
+            k_strides,
+            &input,
+            &kernel,
+            Output::new(output)
+        )
+    );
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}
