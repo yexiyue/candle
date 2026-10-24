@@ -37,6 +37,20 @@ registry release. If a change ever requires new candle API, the affected
 Talechime crates must be marked `publish = false` until the change lands
 upstream.
 
+### `candle-core` + `candle-metal-kernels`: fused shared-tap single-channel conv1d (Metal)
+
+- Motivation: anti-aliased FIR filters (BigVGAN vocoder) issue conv1d as a
+  batch of `(b*c, 1, L)` rows against one `(1, 1, k <= 12)` shared kernel.
+  The generic Metal path materializes a k-times-larger im2col buffer and then
+  runs `b*c` tiny GEMMs, which is pure overhead for K-tap dot products.
+- Change: when `padding == 0`, dtype `F32`, `c_in == c_out == 1`,
+  `k <= 64` and both layouts are contiguous, dispatch to a fused
+  one-thread-per-output kernel (`conv1d_shared_f32`); every other shape keeps
+  the generic path.
+- Effect: IndexTTS BigVGAN FIR stages on Apple M4 Pro, offline probe:
+  fir_down ~6.6x, fir_up ~4x faster; fixed-input deviation vs the generic
+  path <= 9.5e-7. Behaviour-only, no public API change.
+
 ## Removing the fork
 
 Delete the `[patch.crates-io]` block in the Talechime workspace `Cargo.toml`,

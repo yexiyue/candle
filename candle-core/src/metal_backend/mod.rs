@@ -922,6 +922,48 @@ impl BackendStorage for MetalStorage {
         let padding = params.padding;
         let k_size = params.k_size;
         let l_out = (dims[2] + 2 * padding - dilation * (k_size - 1) - 1) / stride + 1;
+        // Shared-tap single-channel fast path (anti-aliased FIR filters):
+        // every output element is one small K-tap dot product, so the im2col
+        // materialization plus batched matmul of the generic path only adds
+        // memory traffic and tiny per-row GEMMs.
+        let k_dims = kernel_l.shape().dims();
+        if padding == 0
+            && self.dtype == DType::F32
+            && dims[1] == 1
+            && k_dims[0] == 1
+            && k_dims[1] == 1
+            && k_size <= 64
+            && layout.is_contiguous()
+            && kernel_l.is_contiguous()
+        {
+            let dst_el = dims[0] * l_out;
+            let dst = self
+                .device
+                .new_buffer_builder()
+                .with_size_for(dst_el, self.dtype)
+                .with_label("conv1d_shared")
+                .build()?;
+            let encoder = self.device.command_encoder()?;
+            let src = buffer_o(&self.buffer, layout, self.dtype);
+            let kbuf = buffer_o(&kernel.buffer, kernel_l, kernel.dtype());
+            candle_metal_kernels::call_conv1d_shared(
+                &self.device.device,
+                &encoder,
+                &self.device.kernels,
+                "conv1d_shared_f32",
+                l_out,
+                (k_size, stride, dilation),
+                dims,
+                strides,
+                kernel_l.stride(),
+                src,
+                kbuf,
+                &dst,
+            )
+            .map_err(MetalError::from)?;
+            drop(encoder);
+            return Ok(Self::new(dst, device, dst_el, self.dtype));
+        }
         let dst_el = dims[0] * l_out * dims[1] * k_size;
         let dst = self
             .device
@@ -2375,4 +2417,72 @@ fn read_to_vec<T: Clone>(buffer: &Buffer, n: usize) -> Vec<T> {
     assert!(!ptr.is_null());
     let slice = unsafe { std::slice::from_raw_parts(ptr, n) };
     slice.to_vec()
+}
+
+#[cfg(test)]
+mod conv1d_tests {
+    use crate::{Device, Tensor};
+
+    /// The fused shared-tap single-channel fast path must match the generic
+    /// conv1d on the anti-aliased-FIR shapes: a batch of `(b, 1, l)` rows
+    /// against one `(1, 1, k)` kernel with valid padding, stride 1 or 2.
+    /// GPU tests share one Metal device/stream, so run single threaded.
+    #[test]
+    #[ignore = "requires a Metal device; run with --test-threads=1"]
+    fn conv1d_shared_matches_cpu_reference() {
+        let device = Device::new_metal(0).unwrap();
+        let cpu = Device::Cpu;
+        let mut state = 0x00C0_FFEE_u32;
+        let mut next = move || {
+            state = state.wrapping_mul(1_103_515_245).wrapping_add(12_345);
+            ((state >> 16) as f32 / 32768.0 - 1.0) * 2.0
+        };
+        for (b, l, k, stride) in [
+            (1usize, 502usize, 12usize, 2usize),
+            (768, 1978, 12, 2),
+            (48, 62986, 12, 2),
+            (96, 31498, 6, 1),
+            (17, 997, 1, 1),
+            (3, 610, 64, 2),
+        ] {
+            let xs: Vec<f32> = (0..b * l).map(|_| next()).collect();
+            let ks: Vec<f32> = (0..k).map(|_| next()).collect();
+            let out_m = Tensor::from_vec(xs.clone(), (b, 1, l), &device)
+                .unwrap()
+                .conv1d(
+                    &Tensor::from_vec(ks.clone(), (1, 1, k), &device).unwrap(),
+                    0,
+                    stride,
+                    1,
+                    1,
+                )
+                .unwrap();
+            let want = Tensor::from_vec(xs, (b, 1, l), &cpu)
+                .unwrap()
+                .conv1d(
+                    &Tensor::from_vec(ks, (1, 1, k), &cpu).unwrap(),
+                    0,
+                    stride,
+                    1,
+                    1,
+                )
+                .unwrap()
+                .to_vec3::<f32>()
+                .unwrap();
+            let flatten =
+                |v: Vec<Vec<Vec<f32>>>| -> Vec<f32> { v.into_iter().flatten().flatten().collect() };
+            let got: Vec<f32> = flatten(out_m.to_device(&cpu).unwrap().to_vec3::<f32>().unwrap());
+            let want: Vec<f32> = flatten(want);
+            assert_eq!(got.len(), want.len());
+            let mut max_abs = 0f32;
+            for (g, w) in got.iter().zip(want.iter()) {
+                assert!(g.is_finite());
+                max_abs = max_abs.max((g - w).abs());
+            }
+            assert!(
+                max_abs <= 1e-5,
+                "b={b} l={l} k={k} stride={stride} max_abs={max_abs}"
+            );
+        }
+    }
 }

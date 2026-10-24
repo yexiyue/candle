@@ -375,3 +375,47 @@ pub fn call_conv_transpose2d(
     encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
     Ok(())
 }
+
+/// Fused shared-tap single-channel conv1d: input `(b, 1, l)`, kernel
+/// `(1, 1, k)`, valid padding. One thread per output element.
+#[allow(clippy::too_many_arguments)]
+pub fn call_conv1d_shared(
+    device: &Device,
+    ep: impl EncoderProvider,
+    kernels: &Kernels,
+    name: &'static str,
+    l_out: usize,
+    (k_size, stride, dilation): (usize, usize, usize),
+    src_shape: &[usize],
+    src_strides: &[usize],
+    k_strides: &[usize],
+    input: BufferOffset,
+    kernel: BufferOffset,
+    output: &Buffer,
+) -> Result<(), MetalKernelError> {
+    let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
+    let dst_el = src_shape[0] * l_out;
+
+    let encoder = ep.encoder();
+    let encoder: &ComputeCommandEncoder = encoder.as_ref();
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
+    encoder.set_compute_pipeline_state(&pipeline);
+    debug_group!(encoder, "conv1d_shared {name} dst_el={dst_el}");
+    set_params!(
+        encoder,
+        (
+            dst_el,
+            l_out,
+            k_size,
+            stride,
+            dilation,
+            src_strides,
+            k_strides,
+            &input,
+            &kernel,
+            Output::new(output)
+        )
+    );
+    encoder.dispatch_thread_groups(thread_group_count, thread_group_size);
+    Ok(())
+}

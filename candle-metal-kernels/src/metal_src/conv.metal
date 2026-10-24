@@ -715,3 +715,59 @@ CONVT2D_OP(half, float, conv_transpose2d_f16)
 #if defined(__HAVE_BFLOAT__)
 CONVT2D_OP(bfloat, float, conv_transpose2d_bf16)
 #endif
+
+// Fused 1D convolution for the shared-tap single-channel case used by
+// anti-aliased FIR filters: batch of (1 -> 1) channel rows sharing one
+// (1, 1, k) kernel. Each output element is a single K-tap dot product, so
+// the generic im2col materialization plus batched matmul only adds traffic.
+template <typename T, typename A>
+METAL_FUNC void conv1d_shared(
+    constant size_t &dst_el,
+    constant size_t &l_out,
+    constant size_t &k_size,
+    constant size_t &stride,
+    constant size_t &dilation,
+    constant size_t *src_strides,
+    constant size_t *k_strides,
+    device const T *src,
+    device const T *k,
+    device T *dst,
+    uint tid [[ thread_position_in_grid ]]
+) {
+  if (tid >= dst_el) {
+    return;
+  }
+  const size_t b_idx = tid / l_out;
+  const size_t l_idx = tid % l_out;
+  const size_t base = b_idx * src_strides[0];
+  A acc = 0;
+  for (size_t kk = 0; kk < k_size; ++kk) {
+    const size_t src_i = base + (l_idx * stride + kk * dilation) * src_strides[2];
+    const size_t k_i = kk * k_strides[2];
+    acc += static_cast<A>(src[src_i]) * static_cast<A>(k[k_i]);
+  }
+  dst[tid] = static_cast<T>(acc);
+}
+
+#define CONV1D_SHARED_OP(TYPENAME, TYPEACC, FN_NAME) \
+kernel void FN_NAME( \
+    constant size_t &dst_el, \
+    constant size_t &l_out, \
+    constant size_t &k_size, \
+    constant size_t &stride, \
+    constant size_t &dilation, \
+    constant size_t *src_strides, \
+    constant size_t *k_strides, \
+    device const TYPENAME *src, \
+    device const TYPENAME *k, \
+    device TYPENAME *dst, \
+    uint tid [[ thread_position_in_grid ]] \
+) { \
+  conv1d_shared<TYPENAME, TYPEACC>(dst_el, l_out, k_size, stride, dilation, src_strides, k_strides, src, k, dst, tid); \
+} \
+
+CONV1D_SHARED_OP(float, float, conv1d_shared_f32)
+CONV1D_SHARED_OP(half, float, conv1d_shared_f16)
+#if defined(__HAVE_BFLOAT__)
+CONV1D_SHARED_OP(bfloat, float, conv1d_shared_bf16)
+#endif
