@@ -440,10 +440,12 @@ pub fn call_conv1d_dense(
 ) -> Result<(), MetalKernelError> {
     let pipeline = kernels.load_pipeline(device, Source::Conv, name)?;
     let dst_el = b_size * l_out * c_out;
+    // One thread per 8-wide output tile along l (the kernel guards the tail).
+    let tiles = l_out.div_ceil(8);
 
     let encoder = ep.encoder();
     let encoder: &ComputeCommandEncoder = encoder.as_ref();
-    let (thread_group_count, thread_group_size) = linear_split(&pipeline, dst_el);
+    let (thread_group_count, thread_group_size) = linear_split(&pipeline, b_size * c_out * tiles);
     encoder.set_compute_pipeline_state(&pipeline);
     debug_group!(encoder, "conv1d_dense {name} dst_el={dst_el}");
     set_params!(

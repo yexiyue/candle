@@ -792,25 +792,41 @@ METAL_FUNC void conv1d_dense(
     device T *dst,
     uint tid [[ thread_position_in_grid ]]
 ) {
-  if (tid >= dst_el) {
+  // One thread computes up to 8 consecutive outputs along l, so each
+  // (c, kk) step reads one contiguous 8-wide src window and the k row is
+  // reused across the whole thread group (same co). This keeps the naive
+  // per-output variant's ~9 GB of redundant scattered reads from ever
+  // reaching DRAM.
+  constexpr size_t TL = 8;
+  const size_t tiles = (l_out + TL - 1) / TL;
+  const size_t l0 = (tid % tiles) * TL;
+  const size_t co = (tid / tiles) % c_out;
+  const size_t b_idx = tid / (tiles * c_out);
+  if (co >= c_out || b_idx * c_out * l_out + co * l_out + l0 >= dst_el) {
     return;
   }
-  // dst is (b, c_out, l_out) row-major.
-  const size_t l_idx = tid % l_out;
-  const size_t co = (tid / l_out) % c_out;
-  const size_t b_idx = tid / (l_out * c_out);
+  const size_t n_out = min(TL, l_out - l0);
   const size_t src_base = b_idx * src_strides[0];
   const size_t k_base = co * k_strides[0];
-  A acc = 0;
+  A acc[TL];
+  for (size_t j = 0; j < TL; ++j) {
+    acc[j] = 0;
+  }
   for (size_t c = 0; c < c_in; ++c) {
     const size_t src_c = src_base + c * src_strides[1];
     const size_t k_c = k_base + c * k_strides[1];
     for (size_t kk = 0; kk < k_size; ++kk) {
-      acc += static_cast<A>(src[src_c + (l_idx + kk) * src_strides[2]]) *
-             static_cast<A>(k[k_c + kk * k_strides[2]]);
+      const A kt = static_cast<A>(k[k_c + kk * k_strides[2]]);
+      const size_t src_l = src_c + (l0 + kk) * src_strides[2];
+      for (size_t j = 0; j < n_out; ++j) {
+        acc[j] += static_cast<A>(src[src_l + j * src_strides[2]]) * kt;
+      }
     }
   }
-  dst[tid] = static_cast<T>(acc);
+  const size_t dst_base = b_idx * c_out * l_out + co * l_out + l0;
+  for (size_t j = 0; j < n_out; ++j) {
+    dst[dst_base + j] = static_cast<T>(acc[j]);
+  }
 }
 
 #define CONV1D_DENSE_OP(TYPENAME, TYPEACC, FN_NAME) \

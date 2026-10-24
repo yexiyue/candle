@@ -105,6 +105,10 @@ upstream.
   against the CPU reference (incl. the grouped positional-conv geometry).
 - Effect: CosyVoice3 DiT input embedding conv. Behaviour-only, no public
   API change in `candle-core` (launcher lives in `candle-metal-kernels`).
+- v2: one thread per 8-wide output tile along `l` (contiguous src window
+  reads, k row reused across the thread group). The naive one-thread-per-
+  output variant was memory-latency bound (~9 GB of redundant scattered
+  reads per conv) and slower than im2col; the tiled variant is not.
 
 ## Removing the fork
 
